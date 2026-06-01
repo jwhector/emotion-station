@@ -12,10 +12,31 @@ An interactive audiovisual piece where you *are* the seed of an emotion and must
 
 ```bash
 npm install
+cp .env.example .env.local   # then fill in your Supabase values (see below)
 npm run dev
 ```
 
 Then open the URL Vite prints (defaults to http://localhost:5173). Click through the welcome screen and press **Awaken** to start audio — browsers require a user gesture before audio can play.
+
+Without Supabase configured the app still runs — the gallery just shows the built-in
+mock pieces and submissions aren't shared.
+
+## Shared gallery (Supabase)
+
+Submissions are persisted to a shared [Supabase](https://supabase.com/) Postgres table
+so every visitor's gallery is populated by everyone else's pieces.
+
+1. Create a free Supabase project.
+2. In the SQL editor, run [`supabase/schema.sql`](supabase/schema.sql) — it creates the
+   `submissions` table and the row-level-security policies (anonymous read + validated
+   insert).
+3. Copy `.env.example` to `.env.local` and set `VITE_SUPABASE_URL` and
+   `VITE_SUPABASE_ANON_KEY` from **Project Settings → API**.
+4. For deploys, set those same two vars in **Vercel → Settings → Environment Variables**
+   (Production + Preview), then redeploy.
+
+The anon key is public by design — it's compiled into the static bundle. Security comes
+from the RLS policies, not key secrecy.
 
 ## Scripts
 
@@ -44,5 +65,5 @@ vercel --prod # production deploy
 
 ## Notes
 
-- **Persistence:** The gallery persists submissions via a `window.storage` API. On the web this is backed by `localStorage` through a small shim in `src/storage.js`, so submissions are stored per-browser. There is no shared backend — each visitor sees their own submissions plus the built-in mock pieces.
+- **Persistence:** The gallery persists submissions to a shared Supabase table via `src/submissions.js` (`saveSubmission` / `fetchRecentSubmissions`). Real submissions are shown first, followed by the built-in demo pieces (always included as examples). If Supabase isn't configured or is unreachable, only the demos show, so the gallery is never blank.
 - **Audio:** Sound only begins after the **Awaken** interaction, per browser autoplay policies.

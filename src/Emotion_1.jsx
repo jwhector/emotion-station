@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import * as Tone from "tone";
+import { saveSubmission, fetchRecentSubmissions } from "./submissions.js";
 
 /* ============================================================ *
  *  EMBODIED
@@ -166,6 +167,7 @@ export default function App(){
 
   const synthRef=useRef(null),padRef=useRef(null),bassRef=useRef(null),counterRef=useRef(null),choirRef=useRef(null);
   const filterRef=useRef(null),reverbRef=useRef(null),seqRef=useRef(null);
+  const audioSetRef=useRef({bpm:96,cut:6500}); // last values ramped to audio params (avoids per-frame rampTo flooding)
   const eff=useRef({tint:WHITE,spin:0.13,halo:1,texture:0,size:1.2,sat:0,sharp:0.6,third:null,seventh:null,regSemis:0,wet:0.22,bass:false,counter:false,choir:false,gate:0});
 
   useEffect(()=>{phaseRef.current=phase;},[phase]);
@@ -232,11 +234,12 @@ export default function App(){
       if(e.counter&&step%4===2){ const ci=e.third!==null?e.third:7; counterRef.current.triggerAttackRelease(midiToNote(ROOT_MIDI+12+ci+e.regSemis),"16n",time,0.5); }
     },[...Array(16).keys()],"16n");
     seq.start(0); seqRef.current=seq; Tone.Transport.start();
-    setAssignedEmotion(EMOTIONS[Math.floor(Math.random()*EMOTIONS.length)].id);
     setAudioReady(true); setPhase("movement");
   },[]);
 
-  const beginIntro=useCallback(()=>{ setWelcomeExit(true); setTimeout(()=>setPhase("intro"),820); },[]);
+  // welcome -> reveal the assigned emotion first, then learn to move
+  const beginAssignment=useCallback(()=>{ setAssignedEmotion(EMOTIONS[Math.floor(Math.random()*EMOTIONS.length)].id); setWelcomeExit(true); setTimeout(()=>setPhase("assignment"),820); },[]);
+  const enterIntro=useCallback(()=>setPhase("intro"),[]);
   const audition=useCallback((i)=>{setSelected(i);patternRef.current=PRESETS[i];},[]);
   const lockMovement=useCallback(()=>{if(selected===null)return;setLocked(selected);cameraRef.current={x:0,y:0};setFocus({r:2,c:2});setPhase("grid");},[selected]);
   const lockRow=useCallback(()=>{
@@ -257,13 +260,14 @@ export default function App(){
     const step=Math.max(1,Math.floor(raw.length/120)); const path=raw.filter((_,i)=>i%step===0);
     const id="u_"+Math.random().toString(36).slice(2,9);
     const sub={ id, emotion:assignedEmotion, presetId:PRESETS[locked].id, lockedCols:{...lockedCols}, path, ts:Date.now() };
-    try{ await window.storage.set("sub:"+id, JSON.stringify(sub), true); }catch(e){}
+    try{ await saveSubmission(sub); }catch(e){}
     setMySubId(id); playRef.current.playing=false; setPlayingPath(false); setPhase("gallery");
   },[assignedEmotion,locked,lockedCols]);
 
   const loadPool=useCallback(async()=>{
     let stored=[];
-    try{ const r=await window.storage.list("sub:",true); if(r&&r.keys){ for(const k of r.keys.slice(0,16)){ try{ const v=await window.storage.get(k,true); if(v&&v.value) stored.push(JSON.parse(v.value)); }catch(e){} } } }catch(e){}
+    try{ stored=await fetchRecentSubmissions(16); }catch(e){ stored=[]; }
+    // real submissions first, then the demo pieces always shown as examples
     const seen=new Set(); const merged=[];
     for(const sub of [...stored,...MOCKS]){ if(!sub||seen.has(sub.id)||sub.id===mySubId) continue; seen.add(sub.id); merged.push(sub); }
     setPool(merged);
@@ -286,7 +290,7 @@ export default function App(){
     cameraRef.current={x:0,y:0}; setFocus({r:2,c:2});
     if(audioReady)Tone.Transport.bpm.rampTo(96,0.2); setPhase("movement");
   },[audioReady]);
-  const toggleRecord=useCallback(()=>{ if(recRef.current.recording){recRef.current.recording=false;setRecording(false);} else {recRef.current={recording:true,path:[],t0:performance.now()};setRecording(true);setPlayingPath(false);playRef.current.playing=false;} },[]);
+  const toggleRecord=useCallback(()=>{ if(recRef.current.recording){recRef.current.recording=false;setRecording(false);} else {recRef.current={recording:true,path:[],t0:performance.now(),last:0};setRecording(true);setPlayingPath(false);playRef.current.playing=false;} },[]);
   const togglePlay=useCallback(()=>{ if(playRef.current.playing){playRef.current.playing=false;setPlayingPath(false);} else if(recRef.current.path.length>2){playRef.current={playing:true,t0:performance.now()};setPlayingPath(true);} },[]);
 
   useEffect(()=>{
@@ -393,9 +397,18 @@ export default function App(){
         if(ph==="listen"&&listenRef.current.path){ const pth=listenRef.current.path,dur=pth[pth.length-1].t||1; const el=(now-listenRef.current.t0)%dur; let i=0; while(i<pth.length-1&&pth[i+1].t<el)i++; planeTargetRef.current={x:pth[i].x,y:pth[i].y}; }
         else if(playRef.current.playing&&recRef.current.path.length>2){ const pth=recRef.current.path,dur=pth[pth.length-1].t||1; const el=(now-playRef.current.t0)%dur; let i=0; while(i<pth.length-1&&pth[i+1].t<el)i++; planeTargetRef.current={x:pth[i].x,y:pth[i].y}; }
         const cur=planeCurRef.current,tgt=planeTargetRef.current; cur.x+=(tgt.x-cur.x)*0.06; cur.y+=(tgt.y-cur.y)*0.06;
-        if(ph==="plane"&&recRef.current.recording)recRef.current.path.push({t:now-recRef.current.t0,x:cur.x,y:cur.y});
+        // sample at ~30fps and hard-cap length so a long recording can't grow the
+        // path unbounded (the trace is re-drawn in full every frame -> O(n) per frame)
+        if(ph==="plane"&&recRef.current.recording){ const rec=recRef.current;
+          if(now-rec.last>=33&&rec.path.length<2000){ rec.path.push({t:now-rec.t0,x:cur.x,y:cur.y}); rec.last=now; } }
         const ar=(cur.x+1)/2,val=(cur.y+1)/2; e.gate=1-ar;
-        if(audioReady){ Tone.Transport.bpm.rampTo(60+ar*96,0.1); filterRef.current.frequency.rampTo(220*Math.pow(2,val*4.6),0.1); }
+        if(audioReady){
+          // only ramp when the target moves meaningfully — calling rampTo every frame
+          // floods the Web Audio automation timeline and eventually hangs the tab
+          const bpm=60+ar*96, cut=220*Math.pow(2,val*4.6), as=audioSetRef.current;
+          if(Math.abs(bpm-as.bpm)>0.5){ Tone.Transport.bpm.rampTo(bpm,0.12); as.bpm=bpm; }
+          if(Math.abs(cut-as.cut)>as.cut*0.01){ filterRef.current.frequency.rampTo(cut,0.12); as.cut=cut; }
+        }
         const px=W/2,py=H/2,rad=Math.min(W,H)*0.40;
         for(const a of ATTRACTORS){ const ax=px+a.x*rad,ay=py-a.y*rad; const g=ctx.createRadialGradient(ax,ay,0,ax,ay,rad*1.1);
           g.addColorStop(0,`rgba(${a.col[0]},${a.col[1]},${a.col[2]},.16)`); g.addColorStop(1,"rgba(0,0,0,0)"); ctx.fillStyle=g; ctx.fillRect(0,0,W,H); }
@@ -504,13 +517,25 @@ export default function App(){
         .revealline b{font-weight:500}
         .revealtag{font-size:11px;letter-spacing:.2em;text-transform:uppercase}
                 .fade-in{animation:fade 1.1s ease both}@keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1}}
+        .assign-layer{--ec:#c9a45c}
+        .assign-glow{position:absolute;inset:0;pointer-events:none;mix-blend-mode:screen;background:radial-gradient(58% 58% at 50% 48%,var(--ec),transparent 70%);opacity:0;animation:assignGlow 2.6s ease both}
+        @keyframes assignGlow{from{opacity:0}to{opacity:.18}}
+        .assign-orb{width:118px;height:118px;border-radius:50%;background:radial-gradient(circle at 38% 34%,#fff7e8 0%,var(--ec) 58%,transparent 74%);box-shadow:0 0 60px 14px var(--ec);margin-bottom:34px;opacity:0;transform:scale(.2);animation:assignOrbIn 1.5s cubic-bezier(.2,.8,.2,1) both,assignOrbPulse 3.6s ease-in-out infinite 1.5s}
+        @keyframes assignOrbIn{from{opacity:0;transform:scale(.2)}to{opacity:1;transform:scale(1)}}
+        @keyframes assignOrbPulse{0%,100%{box-shadow:0 0 50px 10px var(--ec);transform:scale(1)}50%{box-shadow:0 0 86px 24px var(--ec);transform:scale(1.06)}}
+        .assign-kicker{color:#9a9788;opacity:0;animation:wlrise 1.2s ease both;animation-delay:.2s}
+        .assign-name{font-family:'Fraunces',serif;font-weight:300;font-size:clamp(48px,12vw,128px);line-height:1;letter-spacing:.01em;color:var(--ec);text-shadow:0 0 52px var(--ec);opacity:0;animation:assignNameIn 1.6s cubic-bezier(.2,.8,.2,1) both;animation-delay:.7s}
+        @keyframes assignNameIn{from{opacity:0;transform:translateY(22px) scale(.93);filter:blur(9px)}to{opacity:1;transform:translateY(0) scale(1);filter:blur(0)}}
+        .assign-body{opacity:0;animation:wlrise 1.4s ease both;animation-delay:1.6s}
+        .assign-body em{font-style:italic;color:var(--ec)}
+        .assign-btn{opacity:0;animation:wlrise 1.4s ease both;animation-delay:2.3s}
       `}</style>
 
       <canvas ref={canvasRef}/>
       {(phase==="grid"||phase==="plane")&&(<div className="overlay" onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerLeave={onUp}/>)}
 
       {phase==="welcome"&&(
-        <div className={`welcome ${welcomeExit?"wexit":""}`} onClick={beginIntro}>
+        <div className={`welcome ${welcomeExit?"wexit":""}`} onClick={beginAssignment}>
           <div className="seed"/>
           <div className="wlines">
             <p className="wl" style={{animationDelay:"0.6s"}}>Welcome.</p>
@@ -529,6 +554,17 @@ export default function App(){
           <h1 className="title">Learning to <em>Move</em></h1>
           <p className="body">You are an emotion with no body yet — no color, no feeling, only the possibility of motion. Before you can feel, you must learn how to move.</p>
           <button className="btn" onClick={initAudio}>Awaken</button>
+        </div>
+      )}
+
+      {phase==="assignment"&&assignedEmotion&&(
+        <div className="layer assign-layer" style={{["--ec"]:`rgb(${emoCol(assignedEmotion).join(",")})`}}>
+          <div className="assign-glow"/>
+          <div className="kicker assign-kicker">You have been given a feeling to grow</div>
+          <div className="assign-orb"/>
+          <h1 className="assign-name">{assignedEmotion}</h1>
+          <p className="body assign-body">This is the emotion you must become. Everything you grow should make a listener feel <em>{assignedEmotion.toLowerCase()}</em>.</p>
+          <button className="btn assign-btn" onClick={enterIntro}>Begin to grow →</button>
         </div>
       )}
 
